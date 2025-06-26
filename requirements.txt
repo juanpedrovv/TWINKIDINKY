@@ -1,0 +1,44 @@
+# Núcleo científico
+matplotlib>=3.5.3
+networkx>=2.6.3
+nltk>=3.7
+numpy>=1.21.6
+pandas>=1.3.5
+scikit_learn>=1.0.2
+
+# RDKit
+rdkit>=2022.9.1
+
+# Modelado sintético
+sdmetrics==0.6.0
+ctgan==0.11.0
+
+# Visualización y utilidades
+seaborn
+dill
+requests
+gensim
+joblib
+wget
+tqdm
+
+# NLP y modelado
+transformers
+datasets
+
+# Estadística
+copulas
+rdt
+xgboost
+
+# Deep learning (resuelto el conflicto)
+torch==1.13.0
+torchvision==0.14.0
+
+# Proyecto PyTrial y asociados
+icd10-cm
+transtab
+promptehr
+trial2vec
+accelerate
+
