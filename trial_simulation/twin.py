@@ -53,10 +53,33 @@ class TWIN(SequenceSimulationBase):
     '''
     Implement a VAE based model for clinical trial patient digital twin simulation [1]_.
     
+    This implementation follows the TWIN paper architecture with key components:
+    
+    1. **Multi-hot to Dense Embedding Conversion (Equation 4)**:
+       - Converts multi-hot vectors x^u_{n,t} ∈ {0,1}^l to dense embeddings h^u_{n,t} ∈ R^d
+       - Uses trainable embedding matrix W_emb^u ∈ R^{l×d}: h^u_{n,t} = x^u_{n,t} · W_emb^u
+       - Implemented in the Encoder class as self.W_emb (previously FC_input)
+    
+    2. **Retrieval Augmented Encoding (Equation 5)**:
+       - Leverages indexed retriever to find K most similar patients
+       - Combines current patient with retrieved neighbors using attention
+       - Formula: ĥ^u_{n,t} = Softmax(x_{n,t} · X_{n,K}^T) · H^u_{n,K}
+       - Improves generalization by incorporating information from similar patients
+    
+    3. **Causality Preserving Module (CPM)**:
+       - Predicts next timestep events while maintaining temporal causality
+       - Ensures medication → adverse event and adverse event → medication relationships
+    
+    4. **Variational Autoencoder Framework**:
+       - Encoder: Multi-hot → Dense Embedding → Latent Space
+       - Decoder: Latent Space → Multi-hot Reconstruction
+       - Enables diverse synthetic patient generation
+    
     Parameters
     ----------
     vocab_size: list[int]
         A list of vocabulary size for different types of events, e.g., for diagnosis, procedure, medication.
+        Used to define the embedding matrix dimensions W_emb^u ∈ R^{vocab_size[u] × emb_size}.
 
     order: list[str]
         The order of event types in each visits, e.g., ``['treatment', 'medication', 'adverse event']``.
@@ -64,15 +87,17 @@ class TWIN(SequenceSimulationBase):
 
     freeze_event: str or list[str]
         The type(s) of event to be frozen during training and generation, e.g., ``['treatment']``.
+        These events remain constant during counterfactual generation.
 
     max_visit: int
-        Maximum number of visits.
+        Maximum number of visits in patient sequences.
 
     emb_size: int
-        Embedding size for encoding input event codes.
+        Embedding size for encoding input event codes (dimension d in W_emb^u ∈ R^{l×d}).
+        This is the hidden dimension of the dense embeddings h^u_{n,t}.
         
     latent_dim: int
-        Size of final latent dimension between the encoder and decoder
+        Size of final latent dimension between the encoder and decoder in the VAE.
 
     learning_rate: float
         Learning rate for optimization based on SGD. Use torch.optim.Adam by default.
@@ -93,13 +118,29 @@ class TWIN(SequenceSimulationBase):
         A unique identifier for the experiment.
 
     verbose: bool
-        If True, print out training progress.
+        If True, print out training progress and detailed information about
+        the multi-hot to embedding conversion and retrieval process.
 
     k: int
-        Number of neighbors for retrieval-augmented encoding.
+        Number of neighbors for retrieval-augmented encoding (K in Equation 5).
+        Controls how many similar patients are retrieved from the memory bank.
 
     Notes
     -----
+    **Implementation Details**:
+    
+    - **Multi-hot Embedding**: The conversion from multi-hot vectors to dense embeddings 
+      is performed by the trainable matrix W_emb in the Encoder class (model.py line ~15).
+      
+    - **Memory Bank**: During training, latent representations of all patients are stored
+      in a memory bank for retrieval-augmented encoding (see _get_all_latent_vectors).
+      
+    - **Similarity Search**: Dot-product similarity is used to find K nearest neighbors
+      in the latent space, following the paper's indexed retriever approach.
+      
+    - **Attention Combination**: Retrieved neighbors are combined using softmax attention
+      as specified in Equation 5 of the paper.
+
     .. [1] Trisha Das*, Zifeng Wang*, and Jimeng Sun. TWIN: Personalized Clinical Trial Digital Twin Generation. KDD'23.
     '''
     def __init__(self, 
@@ -310,10 +351,29 @@ class TWIN(SequenceSimulationBase):
 
     def _translate_sequence_to_df(self, inputs):
         '''
-        returns dataframe from SeqPatientBase
+        Convert sequence patient data to DataFrame format with multi-hot encoding.
+        
+        This function implements the multi-hot vector creation that will later be converted
+        to dense embeddings using the trainable matrix W_emb in Equation (4):
+        h^u_{n,t} = x^u_{n,t} · W_emb^u
+        
+        The process:
+        1. For each patient visit, convert event codes to multi-hot vectors
+        2. x^u_{n,t} ∈ {0,1}^l where l is vocabulary size for event type u
+        3. Each element c_l ∈ {0,1} indicates if event l occurred
+        
+        Args:
+            inputs: SequencePatientBase with visit sequences
+            
+        Returns:
+            DataFrame with columns for each event type in multi-hot format
+            Format: ['People', 'Visit', 'treatment_0', 'treatment_1', ..., 'medication_0', ...]
         '''
         inputs= inputs.visit
         column_names = ['People', 'Visit']
+        
+        # Create column names for each event type's multi-hot representation
+        # This creates the structure for x^u_{n,t} vectors of different event types u
         for i in range(len(self.config['orders'])):
             for j in range(self.config['vocab_size'][i]):
               column_names.append(self.config['orders'][i]+'_'+str(j))
@@ -326,7 +386,12 @@ class TWIN(SequenceSimulationBase):
             for j in range(len(inputs[i])): #each visit
                 binary_visit = [i, j]
                 for k in range(len(self.config["orders"])): #orders indicate the order of events
+                    # Create multi-hot vector x^u_{n,t} ∈ {0,1}^l for event type u
+                    # Initialize with zeros for all possible events of this type
                     event_binary= np.array([0]*self.config['vocab_size'][k])
+                    
+                    # Set elements to 1 for events that occurred (multi-hot encoding)
+                    # This creates the binary vector x^u_{n,t} that will be multiplied by W_emb^u
                     event_binary[inputs[i][j][k]] = 1 #multihot from dense
                     binary_visit.extend(event_binary.tolist())
 
@@ -406,10 +471,20 @@ class UnimodalTWIN(SequenceSimulationBase):
     '''
     Implement a VAE based model for clinical trial patient digital twin simulation [1]_.
     
+    This is a single-modality version of TWIN that focuses on one event type (e.g., medication 
+    or adverse events). It implements the same core components as the full TWIN model:
+    
+    **Key Components**:
+    1. **Multi-hot to Dense Embedding (Equation 4)**: Converts x^u_{n,t} → h^u_{n,t} using W_emb^u
+    2. **Retrieval Augmented Encoding (Equation 5)**: Leverages similar patients for better generalization  
+    3. **Causality Preserving Module**: Maintains temporal relationships between events
+    4. **VAE Framework**: Encoder-Decoder architecture for synthetic data generation
+    
     Parameters
     ----------
     vocab_size: list[int]
         A list of vocabulary size for different types of events, e.g., for diagnosis, procedure, medication.
+        Defines the input dimension l for the embedding matrix W_emb^u ∈ R^{l×d}.
 
     order: list[str]
         The order of event types in each visits, e.g., ``['treatment', 'medication', 'adverse event']``.
@@ -421,15 +496,17 @@ class UnimodalTWIN(SequenceSimulationBase):
 
     freeze_event: str or list[str]
         The event type(s) that will be frozen during training, e.g., ``'medication'`` or ``'adverse event'``.
+        These remain constant during generation (e.g., treatment assignments).
 
     max_visit: int
-        Maximum number of visits.
+        Maximum number of visits in patient sequences.
 
     emb_size: int
-        Embedding size for encoding input event codes.
+        Embedding size for encoding input event codes (dimension d in W_emb^u ∈ R^{l×d}).
+        This determines the size of dense embeddings h^u_{n,t} ∈ R^d.
         
     latent_dim: int
-        Size of final latent dimension between the encoder and decoder
+        Size of final latent dimension between the encoder and decoder in the VAE.
 
     learning_rate: float
         Learning rate for optimization based on SGD. Use torch.optim.Adam by default.
@@ -450,13 +527,22 @@ class UnimodalTWIN(SequenceSimulationBase):
         A unique identifier for the experiment.
 
     verbose: bool
-        If True, print out training progress.
+        If True, print out training progress and embedding conversion details.
 
     k: int
-        Number of neighbors for retrieval-augmented encoding.
+        Number of neighbors for retrieval-augmented encoding (K in Equation 5).
+        Controls how many similar patients are retrieved for each target patient.
 
     Notes
     -----
+    **Architecture Flow**:
+    1. Multi-hot vectors x^u_{n,t} ∈ {0,1}^l (created in _translate_sequence_to_df)
+    2. Dense embeddings h^u_{n,t} = x^u_{n,t} · W_emb^u (Encoder.W_emb in model.py)
+    3. Latent encoding z via VAE (Encoder.FC_mean, Encoder.FC_var)
+    4. Retrieval augmentation ĥ using K-NN + attention (if memory_bank provided)
+    5. Causality-preserving predictions (Predictor module)
+    6. Reconstruction back to multi-hot space (Decoder)
+
     .. [1] Trisha Das*, Zifeng Wang*, and Jimeng Sun. TWIN: Personalized Clinical Trial Digital Twin Generation. KDD'23.
     '''
     def __init__(self,
@@ -625,10 +711,29 @@ class UnimodalTWIN(SequenceSimulationBase):
 
     def _translate_sequence_to_df(self, inputs):
         '''
-        returns dataframe from SeqPatientBase
+        Convert sequence patient data to DataFrame format with multi-hot encoding.
+        
+        This function implements the multi-hot vector creation that will later be converted
+        to dense embeddings using the trainable matrix W_emb in Equation (4):
+        h^u_{n,t} = x^u_{n,t} · W_emb^u
+        
+        The process:
+        1. For each patient visit, convert event codes to multi-hot vectors
+        2. x^u_{n,t} ∈ {0,1}^l where l is vocabulary size for event type u
+        3. Each element c_l ∈ {0,1} indicates if event l occurred
+        
+        Args:
+            inputs: SequencePatientBase with visit sequences
+            
+        Returns:
+            DataFrame with columns for each event type in multi-hot format
+            Format: ['People', 'Visit', 'treatment_0', 'treatment_1', ..., 'medication_0', ...]
         '''
         inputs= inputs.visit
         column_names = ['People', 'Visit']
+        
+        # Create column names for each event type's multi-hot representation
+        # This creates the structure for x^u_{n,t} vectors of different event types u
         for i in range(len(self.config['orders'])):
             for j in range(self.config['vocab_size'][i]):
               column_names.append(self.config['orders'][i]+'_'+str(j))
@@ -641,7 +746,12 @@ class UnimodalTWIN(SequenceSimulationBase):
             for j in range(len(inputs[i])): #each visit
                 binary_visit = [i, j]
                 for k in range(len(self.config["orders"])): #orders indicate the order of events
+                    # Create multi-hot vector x^u_{n,t} ∈ {0,1}^l for event type u
+                    # Initialize with zeros for all possible events of this type
                     event_binary= np.array([0]*self.config['vocab_size'][k])
+                    
+                    # Set elements to 1 for events that occurred (multi-hot encoding)
+                    # This creates the binary vector x^u_{n,t} that will be multiplied by W_emb^u
                     event_binary[inputs[i][j][k]] = 1 #multihot from dense
                     binary_visit.extend(event_binary.tolist())
 
@@ -779,7 +889,34 @@ class UnimodalTWIN(SequenceSimulationBase):
     def _get_all_latent_vectors(self, data):
         """
         Generate memory bank of latent representations for all patients.
-        This implements the indexed retriever mentioned in the paper.
+        
+        This implements the "indexed retriever" mentioned in the TWIN paper for 
+        Retrieval Augmented Encoding (Section 3.2, Equation 5).
+        
+        The memory bank stores latent representations z for all patients, which are later
+        used to find K most similar patients using dot-product similarity:
+        - Similarity calculation: sim(z_n, z_k) = z_n · z_k^T  
+        - Top-K retrieval: retrieve K patients with highest similarity scores
+        - Used in attention-based combination: ĥ^u_{n,t} = Softmax(similarities) · H^u_{n,K}
+        
+        Process:
+        1. For each patient, extract multi-hot vectors x^u_{n,t}
+        2. Convert to dense embeddings using W_emb: h^u_{n,t} = x^u_{n,t} · W_emb^u
+        3. Apply self-attention over patient's visit sequence  
+        4. Encode to latent space z using VAE encoder
+        5. Store all z vectors in memory bank for similarity search
+        
+        Args:
+            data: Training data containing all patient sequences
+            
+        Returns:
+            torch.Tensor: Memory bank of shape [N_patients, latent_dim] containing
+                         latent representations for all patients in the dataset.
+                         This will be used for K-NN retrieval during training/inference.
+        
+        Note:
+            This memory bank enables the retrieval component of Retrieval Augmented Encoding,
+            allowing the model to leverage information from similar patients during generation.
         """
         self.model.eval()
         all_z = []
@@ -802,12 +939,14 @@ class UnimodalTWIN(SequenceSimulationBase):
                 keys = x_input[:, 1:, :]
                 context, _ = self.model.Att(query, keys)
 
-                # Generate latent representation
+                # Generate latent representation using W_emb embedding and VAE encoder
+                # This creates the base representations that will be stored in memory bank
                 out_mean, out_log_var = self.model.Encoder(context[:,0, :])
                 z = self.model.reparameterization(out_mean, torch.exp(0.5 * out_log_var))
                 all_z.append(z.cpu())
         
         self.model.train()
+        # Return concatenated memory bank for indexed retrieval
         return torch.cat(all_z, dim=0).to(self.device)
 
     def fit(self, train_data, outcome_model=None):
