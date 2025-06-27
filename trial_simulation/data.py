@@ -1,7 +1,84 @@
 '''
 Provide data functions for trial data simulation.
 '''
+import torch
+import numpy as np
 from pytrial.data.patient_data import TabularPatientBase, SequencePatientBase
+
+def pad_batch_fn(batch):
+    """
+    Collate function for DataLoader to handle batches of sequences with different lengths.
+    
+    Parameters
+    ----------
+    batch : list
+        List of tuples containing (index, x, y, order, x_unformatted)
+    
+    Returns
+    -------
+    tuple
+        Collated batch with properly padded tensors
+    """
+    indices, sequences, labels, orders, x_unformatted = zip(*batch)
+    
+    # Convert to lists for easier handling
+    indices = list(indices)
+    labels = list(labels) if labels[0] is not None else None
+    orders = orders[0] if orders[0] is not None else None
+    
+    # Handle sequences - convert to tensor format
+    batch_tensors = []
+    max_visits = max(len(seq) for seq in sequences)
+    
+    # Calculate total feature dimensions from orders
+    if hasattr(sequences[0][0][0], '__len__'):
+        # Multi-hot encoded format
+        feature_dims = [len(sequences[0][0][i]) for i in range(len(sequences[0][0]))]
+        total_features = sum(feature_dims)
+    else:
+        # Simple format
+        total_features = len(sequences[0][0])
+    
+    for seq in sequences:
+        # Pad sequence to max_visits
+        padded_seq = []
+        for visit in seq:
+            if hasattr(visit[0], '__len__'):
+                # Multi-hot format: flatten each visit
+                flat_visit = []
+                for event_type in visit:
+                    if isinstance(event_type, (list, tuple)):
+                        flat_visit.extend(event_type)
+                    else:
+                        flat_visit.append(event_type)
+                padded_seq.append(flat_visit)
+            else:
+                padded_seq.append(visit)
+        
+        # Pad with zeros if needed
+        while len(padded_seq) < max_visits:
+            padded_seq.append([0] * total_features)
+        
+        batch_tensors.append(padded_seq)
+    
+    # Convert to tensor
+    x_tensor = torch.FloatTensor(batch_tensors)
+    
+    # Handle x_unformatted - ensure it's in the right format
+    x_unformatted_processed = []
+    for x_unfmt in x_unformatted:
+        if isinstance(x_unfmt, (list, tuple)):
+            processed_unfmt = []
+            for event_data in x_unfmt:
+                if isinstance(event_data, (list, tuple, np.ndarray)):
+                    processed_unfmt.append(torch.FloatTensor(event_data))
+                else:
+                    processed_unfmt.append(torch.FloatTensor([event_data]))
+            x_unformatted_processed.append(processed_unfmt)
+        else:
+            x_unformatted_processed.append([torch.FloatTensor([x_unfmt])])
+    
+    return indices, x_tensor, labels, orders, x_unformatted_processed
 
 class Voc(object):
     def __init__(self):

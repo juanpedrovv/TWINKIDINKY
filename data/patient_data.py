@@ -296,26 +296,23 @@ class SequencePatientBase(Dataset):
         self._parse_inputdata(inputs=data)
 
     def __getitem__(self, index):
-        return_data = {}
-        if self.visit is not None:
-            visits = self.visit[index]
-            if self.metadata['visit']['mode'] == 'tensor':
-                visit_ts = self._dense_visit_to_tensor(visits) # return a dict with keys corresponding to order
-                return_data['v'] = visit_ts
-            else:
-                visit_dict = self._parse_dense_visit_with_order(visits) # return a dict with keys corresponding to otder
-                return_data['v'] = visit_dict
-        
-        if self.feature is not None:
-            return_data['x'] = self.feature[index]
-            
-        if self.label is not None:
-            return_data['y'] = self.label[index]
-        
-        return return_data
+        """
+        Args:
+            index (int): Index
+
+        Returns:
+            tuple: (patient, label) where target is class_index of the target_names.
+        """
+        return (
+            index,
+            self.v[index],
+            self.y[index],
+            self.order,
+            self.v_unformatted[index],
+        )
 
     def __len__(self):
-        return len(self.visit)
+        return len(self.label)
 
     def _get_voc_size(self):
         order = self.metadata['visit']['order']
