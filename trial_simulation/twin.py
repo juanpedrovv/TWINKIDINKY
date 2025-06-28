@@ -308,6 +308,150 @@ class TWIN(SequenceSimulationBase):
         fake_data = self._translate_df_to_sequence(fake_data, test_data, n_per_sample=n_per_sample)
         return fake_data
 
+    def predict_counterfactual(self, test_data, reference_data, n_per_sample=1, n=None, verbose=False):
+        '''
+        Generate counterfactual digital twins following the TWIN paper methodology.
+        
+        This method implements the counterfactual generation as described in Section 3.3 of the TWIN paper:
+        "Counterfactual generation starts from searching X̃_{k,1:T_k} that is the most similar patient 
+        record to X_{n,1:T_n}, where n ∈ T and k ∈ C. Using the baseline feature of the patient n, 
+        the model then generates a synthetic trajectory based on the record of patient k."
+        
+        Parameters
+        ----------
+        test_data: SequencePatient
+            A `SequencePatient` object containing the patient records for whom counterfactuals
+            will be generated. These should be patients from one treatment arm (e.g., treatment arm T).
+            
+        reference_data: SequencePatient
+            A `SequencePatient` object containing the patient records from the opposite treatment arm
+            (e.g., control arm C). For each patient in `test_data`, the method will find the most
+            similar patient in `reference_data` and use their treatment pattern.
+            
+        n_per_sample: int
+            Number of synthetic samples to generate for each patient. Defaults to 1.
+
+        n: int
+            Total number of samples to generate. If provided, overrides `n_per_sample`.
+
+        verbose: bool
+            If True, print generation progress.
+            
+        Returns
+        -------
+        counterfactual_data: SequencePatient
+            A `SequencePatient` object containing the generated counterfactual patient records.
+            Each patient maintains their personal characteristics but follows the treatment
+            pattern of their most similar patient from the reference arm.
+        '''
+        self._input_data_check(test_data)
+        self._input_data_check(reference_data)
+
+        if n is not None: assert isinstance(n, int), 'Input `n` should be integer.'
+        if n_per_sample is not None: assert isinstance(n_per_sample, int), 'Input `n_per_sample` should be integer.'
+        assert (not n_per_sample is None) or (not n is None), 'Either `n` or `n_per_sample` should be provided to generate.'
+        n, n_per_sample = self._compute_n_per_sample(len(test_data), n, n_per_sample)
+
+        # Step 1: Translate sequence data to DataFrames
+        df_test_data = self._translate_sequence_to_df(test_data)
+        df_reference_data = self._translate_sequence_to_df(reference_data)
+
+        verbose = self.config['verbose'] or verbose
+        if verbose:
+            print(f"Generating {n} counterfactual samples for {len(test_data)} individuals with {n_per_sample} samples per individual.")
+            print(f"Using {len(reference_data)} reference patients from the opposite treatment arm.")
+
+        # Step 2: Validate that we have frozen events (treatment)
+        if self.config['freeze_event'] is None or len(self.config['freeze_event']) == 0:
+            raise ValueError("Counterfactual generation requires at least one 'freeze_event' (e.g., 'treatment') to be defined during model initialization.")
+
+        treatment_event_name = self.config['freeze_event'][0]
+        treatment_cols = [col for col in df_test_data.columns if col.startswith(treatment_event_name + '_')]
+        
+        if not treatment_cols:
+            raise ValueError(f"Could not find columns for the treatment event '{treatment_event_name}' in the data.")
+
+        # Step 3: For each patient in test_data, find the most similar patient in reference_data
+        # This implements the paper's approach: "searching X̃_{k,1:T_k} that is the most similar patient record to X_{n,1:T_n}"
+        df_data_counterfactual = df_test_data.copy()
+        
+        # Get non-treatment columns for similarity calculation (personal characteristics)
+        non_treatment_cols = [col for col in df_test_data.columns if not col.startswith(treatment_event_name + '_') and col not in ['People', 'Visit']]
+        
+        if verbose:
+            print("Finding most similar patients from reference arm for each test patient...")
+        
+        for test_patient_id in df_test_data['People'].unique():
+            # Get test patient's visits (excluding treatment columns for similarity)
+            test_patient_visits = df_test_data[df_test_data['People'] == test_patient_id][non_treatment_cols]
+            
+            # Calculate similarity with all reference patients
+            best_similarity = -1
+            best_reference_patient = None
+            
+            for ref_patient_id in df_reference_data['People'].unique():
+                ref_patient_visits = df_reference_data[df_reference_data['People'] == ref_patient_id][non_treatment_cols]
+                
+                # Calculate dot-product similarity as mentioned in the paper
+                # We'll use the average similarity across all visits for simplicity
+                min_visits = min(len(test_patient_visits), len(ref_patient_visits))
+                if min_visits > 0:
+                    similarity = 0
+                    for i in range(min_visits):
+                        test_visit = test_patient_visits.iloc[i].values
+                        ref_visit = ref_patient_visits.iloc[i].values
+                        similarity += np.dot(test_visit, ref_visit) / (np.linalg.norm(test_visit) * np.linalg.norm(ref_visit) + 1e-8)
+                    similarity /= min_visits
+                    
+                    if similarity > best_similarity:
+                        best_similarity = similarity
+                        best_reference_patient = ref_patient_id
+            
+            if best_reference_patient is None:
+                raise ValueError(f"Could not find a suitable reference patient for test patient {test_patient_id}")
+            
+            if verbose and int(test_patient_id) % 10 == 0:
+                print(f"  Patient {test_patient_id} matched with reference patient {best_reference_patient} (similarity: {best_similarity:.3f})")
+            
+            # Step 4: Replace treatment pattern with that of the most similar reference patient
+            # This implements: "using the baseline feature of the patient n, the model then generates 
+            # a synthetic trajectory based on the record of patient k"
+            test_patient_visits_idx = df_data_counterfactual['People'] == test_patient_id
+            ref_patient_treatment = df_reference_data[df_reference_data['People'] == best_reference_patient][treatment_cols]
+            
+            # Match visits and copy treatment patterns
+            test_visits = df_data_counterfactual[test_patient_visits_idx]['Visit'].values
+            ref_visits = df_reference_data[df_reference_data['People'] == best_reference_patient]['Visit'].values
+            
+            for test_visit_num in test_visits:
+                if test_visit_num < len(ref_visits):
+                    # Find the corresponding reference visit treatment
+                    ref_treatment_for_visit = ref_patient_treatment[
+                        df_reference_data[df_reference_data['People'] == best_reference_patient]['Visit'] == test_visit_num
+                    ]
+                    if not ref_treatment_for_visit.empty:
+                        # Update the treatment for this visit
+                        visit_mask = (df_data_counterfactual['People'] == test_patient_id) & (df_data_counterfactual['Visit'] == test_visit_num)
+                        df_data_counterfactual.loc[visit_mask, treatment_cols] = ref_treatment_for_visit.iloc[0].values
+
+        # Step 5: Generate synthetic data for perturbable events using the modified DataFrame
+        fake_data = {k:[] for k in self.config['orders']}
+        for et in self.config['perturb_event']:
+            model = self.models[et]
+            pred = model.predict(df_data_counterfactual, n_per_sample=n_per_sample, verbose=verbose)
+            fake_data[et] = pred
+        
+        # Step 6: Merge generated data with the counterfactual (frozen) treatment data
+        fake_data = self._merge_generated_data(fake_data, df_data_counterfactual, n_per_sample)
+
+        # Step 7: Translate the final DataFrame back to a SequencePatient object
+        fake_data = self._translate_df_to_sequence(fake_data, test_data, n_per_sample=n_per_sample)
+        
+        if verbose:
+            print("Counterfactual generation finished.")
+
+        return fake_data
+
     def _merge_generated_data(self, fake_data, df_data, n_per_sample):
         '''
         Merge generated data for each event type into a single `SequencePatient`.
@@ -659,13 +803,21 @@ class UnimodalTWIN(SequenceSimulationBase):
                 y = y.to(device)
                 optimizer.zero_grad()
                 n_cross_n = torch.matmul(x, x.T)
-                top_5_index = torch.topk(n_cross_n, 4)
+                
+                # Ensure we don't request more neighbors than available samples
+                num_neighbors = min(4, x.shape[0] - 1)  # -1 to exclude self
+                if num_neighbors <= 0:
+                    num_neighbors = 1  # At least get the sample itself
+                
+                top_5_index = torch.topk(n_cross_n, num_neighbors)
                 ext_x=[]
 
                 for i in range(x.shape[0]):
                     x_=[]
                     x_.append(x[i].tolist())
-                    x_.extend(x[top_5_index.indices[i]].tolist())
+                    # Only extend if we have valid neighbors
+                    if num_neighbors > 0:
+                        x_.extend(x[top_5_index.indices[i]].tolist())
                     ext_x.append(x_)
 
                 ext_x= torch.as_tensor(ext_x)
@@ -770,14 +922,20 @@ class UnimodalTWIN(SequenceSimulationBase):
             # evaluate the model on the test set
             n_cross_n = torch.matmul(x, x.T)
     
-            #print(x.shape)
-            top_5_index = torch.topk(n_cross_n, 4)
+            # Ensure we don't request more neighbors than available samples
+            num_neighbors = min(4, x.shape[0] - 1)  # -1 to exclude self
+            if num_neighbors <= 0:
+                num_neighbors = 1  # At least get the sample itself
+            
+            top_5_index = torch.topk(n_cross_n, num_neighbors)
     
             ext_x=[]
             for j in range(x.shape[0]):
                 x_=[]
                 x_.append(x[j].tolist())
-                x_.extend(x[top_5_index.indices[j]].tolist())
+                # Only extend if we have valid neighbors
+                if num_neighbors > 0:
+                    x_.extend(x[top_5_index.indices[j]].tolist())
                 ext_x.append(x_)
     
             ext_x= torch.as_tensor(ext_x)
